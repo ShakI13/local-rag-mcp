@@ -79,7 +79,7 @@ Your JSON response:"""
             response = self.llm_client.chat(
                 model=OLLAMA_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant that decides when to use tools. Always respond with valid JSON only. Answer only in russian language"},
+                    {"role": "system", "content": "You are a helpful assistant that decides when to use tools. Always respond with valid JSON only."},
                     {"role": "user", "content": decision_prompt}
                 ]
             )
