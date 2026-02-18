@@ -1,25 +1,5 @@
 # Local RAG/MCP Knowledge Base Assistant
 
-# 🎯 Agenda - Part 1
-
-- The Problem
-- The Solution
-- Architecture Overview
-- RAG Component
-- MCP Component
-- Implementation Details
-- How It Works
-
-# 🎯 Agenda - Part 2
-
-- Features & Capabilities
-- Live Demo
-- Security & Privacy
-- Performance Considerations
-- Deployment & Scaling
-- Future Enhancements
-- Q & A
-
 # 📋 The Problem
 
 - **Growing Documentation**: Knowledge scattered across files
@@ -123,7 +103,7 @@ LLM:           Ollama (local)
 MCP:           FastMCP
 ```
 
-# 📁 Project Structure - Part 1
+# 📁 Project Structure
 
 ```
 src/
@@ -133,11 +113,6 @@ src/
 ├── rag/
 │   ├── ingest.py      Load documents
 │   ├── chunk.py       Split text
-```
-
-# 📁 Project Structure - Part 2
-
-```
 │   ├── embed.py       Generate embeddings
 │   ├── build_index.py Build FAISS index
 │   └── query.py       Retrieve & generate
