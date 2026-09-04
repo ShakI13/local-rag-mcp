@@ -12,9 +12,48 @@ from rag.query import (
     build_prompt,
     ask_llm,
     prepare_contexts,
+    existence_listing_answer,
 )
 from mcp.client import MCPClient
 from config import OLLAMA_MODEL
+
+
+def mcp_tool_text(payload) -> str:
+    """Unwrap FastMCP / JSON-RPC tools/call payload to plain text."""
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    if not isinstance(payload, dict):
+        return str(payload)
+
+    # Full JSON-RPC envelope
+    if "jsonrpc" in payload and "result" in payload:
+        return mcp_tool_text(payload.get("result"))
+
+    structured = payload.get("structuredContent")
+    if isinstance(structured, dict) and structured.get("result") is not None:
+        value = structured["result"]
+        return value if isinstance(value, str) else str(value)
+
+    content = payload.get("content")
+    if isinstance(content, list):
+        parts = [
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict) and item.get("text")
+        ]
+        if parts:
+            return "\n".join(parts)
+
+    nested = payload.get("result")
+    if isinstance(nested, str):
+        return nested
+    if isinstance(nested, dict):
+        return mcp_tool_text(nested)
+
+    return ""
+
 
 class CompanyKBAssistant:
     """Company Knowledge Base Assistant combining RAG and MCP."""
@@ -37,25 +76,42 @@ class CompanyKBAssistant:
             print(f"Warning: Could not initialize MCP client: {e}")
             self.mcp = None
     
-    def _llm_decide_mcp_usage(self, query: str, contexts):
-        """Ask LLM if MCP tools are needed based on query and retrieved contexts."""
-        if not self.mcp:
-            return None, None
-        
-        # Build context summary for LLM decision
-        context_summary = ""
+    def _mcp_decision_prompt(self, query: str, contexts) -> str:
+        """Build the MCP tool-routing prompt (paths must come from retrieved sources)."""
+        source_paths = []
+        seen = set()
+        for ctx in contexts or []:
+            src = ctx.get("source")
+            if src and src not in seen:
+                seen.add(src)
+                source_paths.append(src)
+
         if contexts:
-            context_summary = f"Retrieved {len(contexts)} relevant chunks from knowledge base:\n"
-            for i, ctx in enumerate(contexts[:3], 1):  # Show first 3 chunks
-                context_summary += f"{i}. From {ctx['source']}: {ctx['text'][:200]}...\n"
+            context_summary = (
+                f"Retrieved {len(contexts)} relevant chunks from knowledge base:\n"
+            )
+            for i, ctx in enumerate(contexts[:3], 1):
+                context_summary += (
+                    f"{i}. From {ctx['source']}: {ctx['text'][:200]}...\n"
+                )
         else:
             context_summary = "No relevant chunks found in knowledge base.\n"
-        
-        decision_prompt = f"""You are helping answer a question using a knowledge base system with RAG (retrieval) and MCP tools.
+
+        if source_paths:
+            paths_block = "Available source paths (copy exactly if using read_document):\n" + "\n".join(
+                f"- {p}" for p in source_paths
+            )
+            example_path = source_paths[0]
+        else:
+            paths_block = "Available source paths: (none — do not call read_document)"
+            example_path = "docs/vacation-policy.md"
+
+        return f"""You are helping answer a question using a knowledge base system with RAG (retrieval) and MCP tools.
 
 User question: {query}
 
 {context_summary}
+{paths_block}
 
 Available MCP tools:
 1. read_document(file_path: str) - Read a specific document file (use when you need full document content)
@@ -67,6 +123,7 @@ Decision rules:
 - If chunks are empty or insufficient, consider using MCP tools
 - If user explicitly asks to read/list/search documents, use the appropriate tool
 - If you need the full content of a specific document mentioned in chunks, use read_document
+- For read_document, file_path MUST be copied EXACTLY from "Available source paths" above. Never invent or shorten paths (e.g. do not invent docs/asyncpg.md).
 - When in doubt, prefer not using MCP (chunks are usually sufficient)
 
 Respond ONLY with valid JSON, no other text:
@@ -74,11 +131,21 @@ Respond ONLY with valid JSON, no other text:
 
 Examples:
 {{"use_mcp": false, "tool": null, "args": {{}}}}
-{{"use_mcp": true, "tool": "read_document", "args": {{"file_path": "docs/vacation-policy.md"}}}}
+{{"use_mcp": true, "tool": "read_document", "args": {{"file_path": "{example_path}"}}}}
 {{"use_mcp": true, "tool": "list_documents", "args": {{}}}}
 {{"use_mcp": true, "tool": "search_documents", "args": {{"query": "vacation"}}}}
 
 Your JSON response:"""
+
+    def _llm_decide_mcp_usage(self, query: str, contexts):
+        """Ask LLM if MCP tools are needed based on query and retrieved contexts."""
+        if not self.mcp:
+            return None, None
+
+        decision_prompt = self._mcp_decision_prompt(query, contexts)
+        allowed_paths = {
+            ctx.get("source") for ctx in (contexts or []) if ctx.get("source")
+        }
 
         try:
             response = self.llm_client.chat(
@@ -102,7 +169,12 @@ Your JSON response:"""
             
             if decision.get("use_mcp", False):
                 tool_name = decision.get("tool")
-                tool_args = decision.get("args", {})
+                tool_args = decision.get("args", {}) or {}
+                if tool_name == "read_document":
+                    path = tool_args.get("file_path")
+                    if path not in allowed_paths:
+                        # Invented / shortened paths are rejected; answer from chunks.
+                        return None, None
                 return tool_name, tool_args
             
             return None, None
@@ -118,7 +190,7 @@ Your JSON response:"""
         
         try:
             result = self.mcp.call_tool(tool_name, tool_args)
-            return result.get("result", "")
+            return mcp_tool_text(result)
         except Exception as e:
             return f"Error calling MCP tool {tool_name}: {str(e)}"
     
@@ -129,6 +201,15 @@ Your JSON response:"""
         if verbose:
             print(f"📚 Retrieved {len(contexts)} relevant chunks from knowledge base")
 
+        listing_answer = existence_listing_answer(user_query, contexts)
+        if listing_answer is not None:
+            return {
+                "answer": listing_answer,
+                "sources": [c["source"] for c in contexts] if contexts else [],
+                "mcp_used": False,
+                "mcp_tool": None,
+            }
+
         mcp_result = None
         mcp_tool_used = None
         tool_name, tool_args = self._llm_decide_mcp_usage(user_query, contexts)
@@ -137,9 +218,18 @@ Your JSON response:"""
             if verbose:
                 print(f"🔧 LLM decided to use MCP tool: {tool_name} with args: {tool_args}")
             mcp_result = self._call_mcp_tool(tool_name, tool_args)
-            mcp_tool_used = tool_name
-            if verbose and mcp_result:
-                print(f"✅ MCP tool returned result (length: {len(mcp_result)} chars)")
+            # Failed / invented paths must not poison generation when RAG already has facts.
+            if mcp_result and mcp_result.startswith("Error") and contexts:
+                if verbose:
+                    print(
+                        f"⚠️  MCP tool failed ({mcp_result[:80]}); "
+                        "answering from retrieved chunks instead"
+                    )
+                mcp_result = None
+            else:
+                mcp_tool_used = tool_name
+                if verbose and mcp_result:
+                    print(f"✅ MCP tool returned result (length: {len(mcp_result)} chars)")
 
         prompt = build_prompt(user_query, contexts)
         if mcp_result:

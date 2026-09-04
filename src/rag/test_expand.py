@@ -2,7 +2,7 @@
 import unittest
 
 from rag.expand import expand_query, parse_keywords
-from rag.query import retrieve
+from rag.query import bm25_query_from_expand, retrieve
 
 
 def _chunk(source: str, chunk_id: int) -> dict:
@@ -28,9 +28,28 @@ class TestParseKeywords(unittest.TestCase):
         self.assertIsNone(parse_keywords(None))
 
 
+class TestBm25QueryFromExpand(unittest.TestCase):
+    def test_unions_english_near_miss_with_original_cyrillic(self):
+        original = (
+            "Привет, я новенький — как у нас ходить в Postgres через asyncpg "
+            "и что с миграциями?"
+        )
+        bm25_q = bm25_query_from_expand(
+            "asyncpg, Postgres, migration, async",
+            original,
+        )
+        self.assertIn("migration", bm25_q.lower())
+        self.assertIn("миграциями", bm25_q)
+
+    def test_does_not_duplicate_when_expand_fell_back_to_original(self):
+        q = "original question"
+        self.assertEqual(bm25_query_from_expand(q, q), q)
+
+
 class TestExpandViaRetrieve(unittest.TestCase):
-    def test_bm25_gets_keywords_vector_gets_original_question(self):
+    def test_bm25_gets_keywords_plus_original_vector_gets_original(self):
         seen = {}
+        original = "привет, подскажи про asyncpg пожалуйста"
 
         def vector_search(query, k):
             seen["vector"] = query
@@ -45,7 +64,7 @@ class TestExpandViaRetrieve(unittest.TestCase):
             return "asyncpg, postgres"
 
         results = retrieve(
-            "привет, подскажи про asyncpg пожалуйста",
+            original,
             _vector_search=vector_search,
             _bm25_search=bm25_search,
             _expand=lambda q: expand_query(q, complete_fn=fake_complete),
@@ -53,8 +72,9 @@ class TestExpandViaRetrieve(unittest.TestCase):
             _top_k=2,
         )
 
-        self.assertEqual(seen["vector"], "привет, подскажи про asyncpg пожалуйста")
-        self.assertEqual(seen["bm25"], "asyncpg, postgres")
+        self.assertEqual(seen["vector"], original)
+        self.assertIn("asyncpg, postgres", seen["bm25"])
+        self.assertIn(original, seen["bm25"])
         self.assertEqual(len(results), 2)
 
     def test_falls_back_to_original_when_model_returns_empty(self):
@@ -91,6 +111,27 @@ class TestExpandViaRetrieve(unittest.TestCase):
             _ensure_ready=lambda: True,
         )
         self.assertEqual(seen["bm25"], "keep working")
+
+    def test_english_near_miss_expand_still_sends_original_to_bm25(self):
+        seen = {}
+        original = (
+            "Привет, я новенький — как у нас ходить в Postgres через asyncpg "
+            "и что с миграциями?"
+        )
+
+        def bm25_search(keywords, k):
+            seen["bm25"] = keywords
+            return [_chunk("migration_policy.md", 0)]
+
+        retrieve(
+            original,
+            _vector_search=lambda q, k: [_chunk("asyncpg.md", 0)],
+            _bm25_search=bm25_search,
+            _expand=lambda q: "asyncpg, Postgres, migration, async",
+            _ensure_ready=lambda: True,
+        )
+        self.assertIn("миграциями", seen["bm25"])
+        self.assertIn("migration", seen["bm25"].lower())
 
 
 if __name__ == "__main__":

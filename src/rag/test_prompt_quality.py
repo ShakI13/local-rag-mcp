@@ -7,6 +7,7 @@ from unittest.mock import patch
 from rag.query import (
     REFUSE_ANSWER,
     build_prompt,
+    existence_listing_answer,
     filter_contexts_for_query,
     prepare_contexts,
 )
@@ -137,6 +138,53 @@ class TestPrepareContextsDirectoryListing(unittest.TestCase):
                 )
 
             self.assertFalse(any(c.get("is_directory_listing") for c in prepared))
+
+
+class TestExistenceListingAnswer(unittest.TestCase):
+    def test_uses_listing_not_refuse_when_asked_file_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            squad = root / "Squad"
+            squad.mkdir()
+            (squad / "Alpha.md").write_text("alpha", encoding="utf-8")
+            (squad / "Gamma.md").write_text("gamma", encoding="utf-8")
+
+            with patch("rag.query.DOCUMENTS_DIR", str(root)):
+                contexts = prepare_contexts(
+                    "Is there a Beta / Delta description under /Squad?",
+                    [
+                        {
+                            "source": str(root / "README.md"),
+                            "chunk_id": 0,
+                            "text": "- Beta\n- Delta",
+                        }
+                    ],
+                )
+                answer = existence_listing_answer(
+                    "Is there a Beta / Delta description under /Squad?",
+                    contexts,
+                )
+
+            self.assertIsNotNone(answer)
+            lower = answer.lower()
+            self.assertNotEqual(answer.strip(), REFUSE_ANSWER)
+            self.assertIn("mention", lower)
+            self.assertIn("no dedicated", lower)
+            self.assertIn("alpha.md", lower)
+            self.assertIn("gamma.md", lower)
+            self.assertIn("/squad", lower)
+
+    def test_does_not_hijack_content_questions(self):
+        contexts = [
+            {
+                "source": "docs/Squad/Alpha.md",
+                "chunk_id": 0,
+                "text": "Alpha owns delivery.",
+            }
+        ]
+        self.assertIsNone(
+            existence_listing_answer("What does Alpha do under /Squad?", contexts)
+        )
 
 
 if __name__ == "__main__":

@@ -145,6 +145,84 @@ def prepare_contexts(query: str, contexts):
     return prepared
 
 
+def _asked_names_from_existence_query(query: str) -> list[str]:
+    """Pull candidate entity names from an existence question (path-agnostic)."""
+    m = re.search(
+        r"(?:is\s+there(?:\s+an?)?|есть\s+ли|does\s+(?:a\s+|an\s+|there\s+)?exist)\s+"
+        r"(.+?)(?:\s+(?:role\s+)?description|\s+описан|\s+under\s+/|\s+в\s+/|\s+file\b)",
+        query or "",
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return []
+    parts = re.split(r"\s*/\s*|\s*,\s*|\s+and\s+|\s+и\s+", m.group(1), flags=re.IGNORECASE)
+    names = []
+    for part in parts:
+        cleaned = re.sub(
+            r"\s+(?:role|description|file|описан\w*)\s*$",
+            "",
+            part.strip(),
+            flags=re.IGNORECASE,
+        ).strip(" ?.,;:")
+        if cleaned and cleaned.lower() not in {"a", "an", "the", "role"}:
+            names.append(cleaned)
+    return names
+
+
+def existence_listing_answer(query: str, contexts):
+    """
+    Deterministic answer when an existence ask already has a directory listing.
+
+    Small models often refuse or say bare Yes despite the listing; answer from
+    the listing instead. Folder path and names come from the query — not hardcoded.
+    """
+    if not _EXISTENCE_ASK_RE.search(query or ""):
+        return None
+    listing = next((c for c in contexts if c.get("is_directory_listing")), None)
+    if not listing:
+        return None
+
+    subdir = _subdir_named_in_query(query) or "the named folder"
+    files = [
+        line[2:].strip()
+        for line in listing["text"].splitlines()
+        if line.startswith("- ")
+    ]
+    asked = _asked_names_from_existence_query(query) or ["the requested item"]
+
+    missing = [
+        name for name in asked if not any(name.lower() in f.lower() for f in files)
+    ]
+    file_list = ", ".join(files) if files else "(none)"
+    if missing:
+        missing_txt = " / ".join(missing)
+        return (
+            f"A README or process mention is not enough: there is no dedicated "
+            f"description file for {missing_txt} under /{subdir}. "
+            f"Files that exist under /{subdir} are: {file_list}."
+        )
+    present_txt = " / ".join(asked)
+    return (
+        f"Yes — dedicated file(s) for {present_txt} exist under /{subdir}: {file_list}."
+    )
+
+
+def bm25_query_from_expand(keywords: str, query: str) -> str:
+    """
+    BM25 input: expanded keywords plus the original question.
+
+    Near-miss English expand (e.g. `migration`) must not drop original Cyrillic
+    terms that would match Russian docs.
+    """
+    kw = (keywords or "").strip()
+    q = (query or "").strip()
+    if not kw:
+        return q
+    if not q or kw == q:
+        return kw
+    return f"{kw} {q}"
+
+
 def _get_model():
     global _model
     if _model is None:
@@ -265,10 +343,11 @@ def retrieve(
 
     expand = _expand or expand_query
     keywords = expand(query)
+    bm25_query = bm25_query_from_expand(keywords, query)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         fut_vector = pool.submit(vector_search, query, lane_k)
-        fut_bm25 = pool.submit(bm25_search, keywords, lane_k)
+        fut_bm25 = pool.submit(bm25_search, bm25_query, lane_k)
         vector_hits = fut_vector.result()
         bm25_hits = fut_bm25.result()
 
@@ -346,6 +425,9 @@ def ask_llm(prompt):
 def ask(query: str):
     """Answer a question using RAG."""
     contexts = prepare_contexts(query, retrieve(query))
+    listing_answer = existence_listing_answer(query, contexts)
+    if listing_answer is not None:
+        return listing_answer, contexts
     prompt = build_prompt(query, contexts)
     return ask_llm(prompt), contexts
 
