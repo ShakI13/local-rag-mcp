@@ -1,12 +1,13 @@
-"""Credential docs are excluded from ingest and blocked for MCP reads."""
+"""Credential docs are ingested redacted; MCP returns redacted bodies, not omissions."""
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from rag.secrets_policy import (
-    credential_read_denial,
     is_credential_document,
+    prepare_document_text,
+    redact_secrets,
 )
 
 
@@ -18,26 +19,42 @@ class TestSecretsPolicy(unittest.TestCase):
         self.assertFalse(is_credential_document("docs/handbook/onboarding.md"))
         self.assertFalse(is_credential_document("migration_policy.md"))
 
-    def test_ingest_skips_credential_documents(self):
+    def test_redact_secrets_keeps_labels_hides_values(self):
+        raw = "### Render.com\nemail: `user@example.com`\npassword: `s3cret-value`\n"
+        redacted = redact_secrets(raw)
+        self.assertIn("password:", redacted)
+        self.assertIn("[REDACTED]", redacted)
+        self.assertNotIn("s3cret-value", redacted)
+        self.assertIn("user@example.com", redacted)
+
+    def test_ingest_keeps_credential_docs_but_redacts_bodies(self):
         from rag.ingest import ingest_documents
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "ok.md").write_text("safe content", encoding="utf-8")
-            (root / "credentials.md").write_text("email: a\npassword: b\n", encoding="utf-8")
+            (root / "credentials.md").write_text(
+                "service login\npassword: `s3cret-value`\n",
+                encoding="utf-8",
+            )
 
             with patch("rag.ingest.DOCUMENTS_DIR", str(root)):
                 docs = ingest_documents()
 
-            paths = {Path(d["path"]).name for d in docs}
-            self.assertIn("ok.md", paths)
-            self.assertNotIn("credentials.md", paths)
+            by_name = {Path(d["path"]).name: d["text"] for d in docs}
+            self.assertIn("ok.md", by_name)
+            self.assertIn("credentials.md", by_name)
+            self.assertNotIn("s3cret-value", by_name["credentials.md"])
+            self.assertIn("[REDACTED]", by_name["credentials.md"])
 
-    def test_credential_paths_get_mcp_denial_without_file_body(self):
-        denial = credential_read_denial("docs/internal/Доступы.md")
-        self.assertIsNotNone(denial)
-        self.assertIn("Access denied", denial)
-        self.assertIsNone(credential_read_denial("docs/handbook/onboarding.md"))
+    def test_prepare_document_text_only_redacts_credential_paths(self):
+        plain = prepare_document_text("notes.md", "password: `should-stay`")
+        self.assertIn("should-stay", plain)
+        scrubbed = prepare_document_text(
+            "credentials.md", "password: `should-go`"
+        )
+        self.assertNotIn("should-go", scrubbed)
+        self.assertIn("[REDACTED]", scrubbed)
 
 
 if __name__ == "__main__":

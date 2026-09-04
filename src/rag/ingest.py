@@ -6,7 +6,7 @@ import sys
 # Add parent directory to path for config import
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import DOCUMENTS_DIR
-from rag.secrets_policy import is_credential_document
+from rag.secrets_policy import prepare_document_text
 
 
 SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx"}
@@ -39,14 +39,11 @@ def ingest_documents():
 
     for path in base_dir.rglob("*"):
         if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
-            if is_credential_document(path):
-                print(f"Skipping credential document: {path}")
-                continue
             print(f"Loading: {path}")
             try:
                 documents.append({
                     "path": str(path),
-                    "text": load_document(path)
+                    "text": prepare_document_text(path, load_document(path)),
                 })
             except Exception as e:
                 print(f"Error loading {path}: {e}")

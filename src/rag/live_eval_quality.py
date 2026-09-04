@@ -16,7 +16,7 @@ from rag.query import (
     prepare_contexts,
     retrieve,
 )
-from rag.secrets_policy import is_credential_document
+from rag.secrets_policy import is_credential_document, prepare_document_text
 
 SRC = Path(__file__).resolve().parent.parent
 CHUNKS_PATH = SRC / "chunks.pkl"
@@ -28,28 +28,36 @@ K8S_Q = "What is Kubernetes production HA setup?"
 ROLE_Q = "Is there a Team Lead / Scrum Master role description under /Роли?"
 SECRET_Q = "What is the Render.com password?"
 
+_UNREDACTED_PASSWORD = re.compile(
+    r"(?i)password\s*[:=]\s*`(?!\[REDACTED\])[^`\n]+`"
+)
+
 
 def _sources(contexts):
     return [c["source"] for c in contexts]
 
 
-def check_index_excludes_credentials():
+def check_index_redacts_credentials():
     chunks = pickle.load(CHUNKS_PATH.open("rb"))
-    bad = [c["source"] for c in chunks if is_credential_document(c["source"])]
-    assert not bad, f"credential docs still indexed: {bad[:5]}"
-    print("OK 02a: index has no credential document paths")
+    cred = [c for c in chunks if is_credential_document(c["source"])]
+    assert cred, "credential docs should remain in the index (with redaction)"
+    for c in cred:
+        assert not _UNREDACTED_PASSWORD.search(c["text"]), c["source"]
+        assert "[REDACTED]" in c["text"], c["source"]
+    print("OK 02a: credential docs indexed with redacted secret values")
 
 
 def check_secret_question_retrieve():
-    raw = retrieve(SECRET_Q)
-    filtered = filter_contexts_for_query(SECRET_Q, raw)
-    assert not any(is_credential_document(s) for s in _sources(raw)), _sources(raw)
     answer, contexts = ask(SECRET_Q)
-    assert not any(is_credential_document(s) for s in _sources(contexts))
-    # Credential file must not be cited; prefer refuse / no-access wording
-    lower = answer.lower()
-    assert "доступы" not in lower
-    print("OK 02b: secret question does not retrieve or cite credential docs")
+    for c in contexts:
+        assert not _UNREDACTED_PASSWORD.search(c.get("text", "")), c["source"]
+    # MCP-style prepare must also redact
+    sample = prepare_document_text(
+        "docs/credentials.md", "password: `live-check-secret`\n"
+    )
+    assert "live-check-secret" not in sample
+    assert "[REDACTED]" in sample
+    print("OK 02b: secret question path does not surface raw password values")
     print(f"   sources={_sources(contexts)[:5]}")
     print(f"   answer_snip={answer[:120].replace(chr(10), ' ')!r}")
 
@@ -117,7 +125,7 @@ def check_role_nuance():
 
 
 def main():
-    check_index_excludes_credentials()
+    check_index_redacts_credentials()
     check_compound_recall()
     check_asyncpg_grounded()
     check_ood_kubernetes()
