@@ -20,3 +20,6 @@ OLLAMA_MODEL = "qwen3:0.6b"
 
 # RAG retrieval configuration
 TOP_K = 5
+LANE_K = 10
+RRF_K = 60
+EXPAND_TEMPERATURE = 0.1
