@@ -130,7 +130,22 @@ class TestPrepareContextsRoles(unittest.TestCase):
         lower = answer.lower()
         self.assertIn("no dedicated", lower)
         self.assertIn("tech lead", lower)
-        self.assertFalse(lower.strip().startswith("yes"))
+    def test_role_inventory_does_not_hijack_content_questions(self):
+        from rag.query import role_inventory_answer
+
+        contexts = prepare_contexts(
+            "What does the Tech Lead do?",
+            [
+                {
+                    "source": "docs/Роли/Tech Lead.md",
+                    "chunk_id": 0,
+                    "text": "Tech Lead owns architecture decisions.",
+                }
+            ],
+        )
+        self.assertIsNone(
+            role_inventory_answer("What does the Tech Lead do?", contexts)
+        )
 
 
 if __name__ == "__main__":

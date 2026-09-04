@@ -38,8 +38,9 @@ _QUERY_STOPWORDS = frozenset(
 )
 
 _ROLE_INVENTORY_RE = re.compile(
-    r"рол(?:и|ь)?|/роли|\broles?\b|team\s*lead|scrum\s*master",
-    re.IGNORECASE,
+    r"(?:is\s+there|есть\s+ли).*(?:role\s+description|описан\w*).*(?:/роли|роли)"
+    r"|(?:role\s+description|описан\w*).*(?:under\s+)?(?:/роли|роли)",
+    re.IGNORECASE | re.DOTALL,
 )
 
 # Lazy globals — avoid loading heavy models on import (tests inject lane doubles)
@@ -62,7 +63,8 @@ def filter_contexts_for_query(query: str, contexts):
         t for t in tokenize_normalized(query) if len(t) >= 4 and t not in _QUERY_STOPWORDS
     }
     if not q_tokens:
-        return list(contexts)
+        # No meaningful tokens left → cannot judge support; treat as unsupported.
+        return []
 
     kept = []
     for chunk in contexts:

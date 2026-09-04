@@ -92,16 +92,13 @@ def check_compound_recall():
     has_mig = "migrat" in joined or "миграц" in joined or "alembic" in joined
     print(f"   top sources={_sources(raw)[:8]}")
     assert has_async, _sources(raw)
-    # Soft assert on migrations — report clearly
-    if has_mig:
-        print("OK 05: Top-K includes asyncpg and migrations-related material")
-    else:
-        print("WARN 05: migrations material weak in Top-K; keywords may still help BM25")
-        # Fail only if keywords also miss migrations half
-        kw = keywords.lower()
-        assert (
-            "migrat" in kw or "миграц" in kw or "alembic" in kw or "миграц" in ASYNC_Q.lower()
-        ), keywords
+    kw = keywords.lower()
+    assert "asyncpg" in kw, keywords
+    assert (
+        "migrat" in kw or "миграц" in kw or "alembic" in kw
+    ), f"expansion missed migrations half: {keywords!r}"
+    assert has_mig, f"Top-K missing migrations material: {_sources(raw)}"
+    print("OK 05: Top-K includes asyncpg and migrations-related material")
 
 
 def check_role_nuance():
