@@ -5,7 +5,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import EXPAND_TEMPERATURE, OLLAMA_MODEL, OLLAMA_URL
 
-EXPAND_PROMPT = """Extract search keywords from the user question.
+EXPAND_PROMPT = """Extract search keywords covering EVERY distinct topic in the question.
+If the question asks about two things (e.g. asyncpg AND migrations), include keywords for each.
 Return ONLY a comma-separated list of short keywords or phrases.
 No greeting, no explanation, no complete sentences.
 

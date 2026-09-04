@@ -7,7 +7,13 @@ from rich.markdown import Markdown
 
 # Add current directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
-from rag.query import retrieve, build_prompt, ask_llm
+from rag.query import (
+    retrieve,
+    build_prompt,
+    ask_llm,
+    prepare_contexts,
+    role_inventory_answer,
+)
 from mcp.client import MCPClient
 from config import OLLAMA_MODEL
 
@@ -119,17 +125,24 @@ Your JSON response:"""
     
     def query(self, user_query: str, verbose=False):
         """Answer a question using RAG and optionally MCP tools."""
-        # Step 1: Retrieve from RAG
-        contexts = retrieve(user_query)
-        
+        contexts = prepare_contexts(user_query, retrieve(user_query))
+
         if verbose:
             print(f"📚 Retrieved {len(contexts)} relevant chunks from knowledge base")
-        
-        # Step 2: Ask LLM if MCP tools are needed
+
+        role_answer = role_inventory_answer(user_query, contexts)
+        if role_answer is not None:
+            return {
+                "answer": role_answer,
+                "sources": [c["source"] for c in contexts] if contexts else [],
+                "mcp_used": False,
+                "mcp_tool": None,
+            }
+
         mcp_result = None
         mcp_tool_used = None
         tool_name, tool_args = self._llm_decide_mcp_usage(user_query, contexts)
-        
+
         if tool_name:
             if verbose:
                 print(f"🔧 LLM decided to use MCP tool: {tool_name} with args: {tool_args}")
@@ -137,20 +150,22 @@ Your JSON response:"""
             mcp_tool_used = tool_name
             if verbose and mcp_result:
                 print(f"✅ MCP tool returned result (length: {len(mcp_result)} chars)")
-        
-        # Step 3: Build prompt with RAG context
+
         prompt = build_prompt(user_query, contexts)
-        
-        # Step 4: Add MCP result if available
         if mcp_result:
-            prompt += f"\n\n<additional_info_from_mcp_tool>\n{mcp_result}\n</additional_info_from_mcp_tool>\n"
-        
-        # Step 5: Generate answer
+            injection = (
+                f"\n\n<additional_info_from_mcp_tool>\n{mcp_result}\n"
+                f"</additional_info_from_mcp_tool>\n"
+            )
+            marker = "<assistant>"
+            if marker in prompt:
+                prompt = prompt.replace(marker, injection + marker, 1)
+            else:
+                prompt += injection
+
         answer = ask_llm(prompt)
-        
-        # Step 6: Prepare response with sources
         sources = [c["source"] for c in contexts] if contexts else []
-        
+
         return {
             "answer": answer,
             "sources": sources,

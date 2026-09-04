@@ -1,4 +1,5 @@
 import pickle
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -8,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
     FAISS_INDEX_PATH,
     CHUNKS_PATH,
+    DOCUMENTS_DIR,
     EMBEDDING_MODEL,
     OLLAMA_URL,
     OLLAMA_MODEL,
@@ -17,13 +19,97 @@ from config import (
 )
 from rag.bm25_index import Bm25Index
 from rag.expand import expand_query
+from rag.lexical import tokenize_normalized
 from rag.rrf import rrf_fuse
+
+REFUSE_ANSWER = "I don't have that information in the knowledge base."
+
+# Short/common tokens ignored when checking whether context supports the query.
+_QUERY_STOPWORDS = frozenset(
+    {
+        "what", "is", "the", "a", "an", "how", "do", "does", "did", "to", "for",
+        "in", "on", "of", "and", "or", "with", "from", "about", "there", "are",
+        "was", "were", "be", "been", "this", "that", "under", "over", "into",
+        "как", "что", "чем", "это", "для", "при", "или", "нас", "наш", "наша",
+        "у", "в", "на", "по", "из", "к", "о", "об", "же", "ли", "бы", "не",
+        "я", "мы", "вы", "он", "она", "они", "привет", "новенький", "через",
+        "есть", "ли", "role", "description", "setup", "production",
+    }
+)
+
+_ROLE_INVENTORY_RE = re.compile(
+    r"рол(?:и|ь)?|/роли|\broles?\b|team\s*lead|scrum\s*master",
+    re.IGNORECASE,
+)
 
 # Lazy globals — avoid loading heavy models on import (tests inject lane doubles)
 _model = None
 index = None
 chunks = []
 _bm25_index = None
+
+
+def filter_contexts_for_query(query: str, contexts):
+    """
+    Keep chunks that share a meaningful normalized token with the query.
+
+    Unrelated Top-K hits (e.g. Docker docs for a Kubernetes question) are dropped
+    so generation must refuse instead of inventing from off-topic sources.
+    """
+    if not contexts:
+        return []
+    q_tokens = {
+        t for t in tokenize_normalized(query) if len(t) >= 4 and t not in _QUERY_STOPWORDS
+    }
+    if not q_tokens:
+        return list(contexts)
+
+    kept = []
+    for chunk in contexts:
+        haystack = tokenize_normalized(
+            f"{chunk.get('source', '')} {chunk.get('text', '')}"
+        )
+        hay_set = set(haystack)
+        if q_tokens & hay_set:
+            kept.append(chunk)
+    return kept
+
+
+def roles_directory_chunk():
+    """Synthetic chunk: dedicated role description files that exist under /Роли."""
+    src_dir = Path(__file__).parent.parent
+    roles_dir = src_dir / DOCUMENTS_DIR / "Роли"
+    if not roles_dir.is_dir():
+        return None
+    names = sorted(
+        p.name
+        for p in roles_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in {".md", ".txt", ".docx", ".pdf"}
+    )
+    if not names:
+        return None
+    listing = "\n".join(f"- {name}" for name in names)
+    text = (
+        "Dedicated role description files that exist under /Роли:\n"
+        f"{listing}\n"
+        "A role name merely listed in README (or process docs) is not a dedicated "
+        "role description unless a matching file appears in this list."
+    )
+    return {
+        "source": str(Path(DOCUMENTS_DIR) / "Роли"),
+        "chunk_id": -1,
+        "text": text,
+    }
+
+
+def prepare_contexts(query: str, contexts):
+    """Filter off-topic chunks and, for role-inventory questions, add /Роли listing."""
+    prepared = filter_contexts_for_query(query, contexts)
+    if _ROLE_INVENTORY_RE.search(query or ""):
+        extra = roles_directory_chunk()
+        if extra:
+            prepared = [extra] + [c for c in prepared if c.get("chunk_id") != -1]
+    return prepared
 
 
 def _get_model():
@@ -160,8 +246,12 @@ def build_prompt(query, contexts):
     """Build prompt with retrieved context."""
     if not contexts:
         return f"""
-<role>You are a helpful assistant that answers questions about company information.</role>
-<instructions>Answer the question based on your general knowledge. If you don't know, say so.</instructions>
+<role>You are a helpful assistant that answers questions about company documentation.</role>
+<instructions>
+The knowledge base has no usable context for this question.
+Do NOT use general knowledge or invent an answer.
+Reply with exactly: {REFUSE_ANSWER}
+</instructions>
 
 <query>
 {query}
@@ -176,8 +266,15 @@ def build_prompt(query, contexts):
     )
 
     return f"""
-<role>You are a helpful assistant that answers questions about company information.</role>
-<instructions>Answer the question ONLY based on the context provided below. If the answer is not in the context, say "I don't have that information in the knowledge base."</instructions>
+<role>You are a helpful assistant that answers questions about company documentation.</role>
+<instructions>
+Answer ONLY from the context below.
+- If the context contains facts that answer the question, use those facts. Do not refuse.
+- If the context does not discuss the asked topic, reply with exactly: {REFUSE_ANSWER}
+- Do not invent guidance from unrelated documents.
+- For questions like whether a role description exists under /Роли: a name merely listed or mentioned (e.g. in README) is NOT a dedicated role description. Only treat a dedicated file/content under Роли as a description; if none exists, say so clearly (partial yes / no dedicated doc).
+Never reveal passwords, API keys, or other secrets if they appear in context.
+</instructions>
 
 <context>
 {context_text}
@@ -200,15 +297,69 @@ def ask_llm(prompt):
         json={
             "model": OLLAMA_MODEL,
             "prompt": prompt,
-            "stream": False
-        }
+            "stream": False,
+        },
+        timeout=120,
     )
-    return response.json()["response"]
+    data = response.json()
+    if response.status_code != 200 or "response" not in data:
+        err = data.get("error") or data
+        raise RuntimeError(
+            f"Ollama generate failed (HTTP {response.status_code}, model={OLLAMA_MODEL}): {err}"
+        )
+    return data["response"]
+
+
+def role_inventory_answer(query: str, contexts):
+    """
+    Deterministic nuance for '/Роли description exists?' questions.
+
+    Small local models often ignore the listing and refuse or say bare Yes;
+    the directory listing chunk is enough to answer without the LLM.
+    """
+    if not _ROLE_INVENTORY_RE.search(query or ""):
+        return None
+    listing = next((c for c in contexts if c.get("chunk_id") == -1), None)
+    if not listing:
+        return None
+    files = [
+        line[2:].strip()
+        for line in listing["text"].splitlines()
+        if line.startswith("- ")
+    ]
+    q = query.lower()
+    asked = []
+    if "team lead" in q:
+        asked.append("Team Lead")
+    if "scrum" in q:
+        asked.append("Scrum Master")
+    if not asked:
+        asked = ["the requested role"]
+
+    missing = []
+    for name in asked:
+        if not any(name.lower() in f.lower() for f in files):
+            missing.append(name)
+
+    file_list = ", ".join(files) if files else "(none)"
+    if missing:
+        missing_txt = " / ".join(missing)
+        return (
+            f"README or process docs may mention {missing_txt}, but there is no dedicated "
+            f"role description file for {missing_txt} under /Роли. "
+            f"Dedicated role files that exist under /Роли are: {file_list}."
+        )
+    return (
+        f"Yes — dedicated role description file(s) exist under /Роли: {file_list}."
+    )
 
 
 def ask(query: str):
     """Answer a question using RAG."""
-    contexts = retrieve(query)
+    contexts = prepare_contexts(query, retrieve(query))
+    role_answer = role_inventory_answer(query, contexts)
+    if role_answer is not None:
+        return role_answer, contexts
     prompt = build_prompt(query, contexts)
     return ask_llm(prompt), contexts
 

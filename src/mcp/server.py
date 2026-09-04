@@ -5,6 +5,7 @@ import sys
 # Add parent directory to path for config import
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import DOCUMENTS_DIR
+from rag.secrets_policy import credential_read_denial, is_credential_document
 
 mcp = FastMCP("doc-tools", version="1.0.0")
 
@@ -17,7 +18,11 @@ def read_document(file_path: str) -> str:
         # Security: ensure path is within documents directory
         if not str(path.resolve()).startswith(str(Path(DOCUMENTS_DIR).resolve())):
             return f"Error: Access denied. File must be in {DOCUMENTS_DIR}"
-        
+
+        denial = credential_read_denial(path)
+        if denial:
+            return denial
+
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
@@ -37,6 +42,8 @@ def list_documents() -> str:
         documents = []
         for path in base_dir.rglob("*"):
             if path.is_file() and path.suffix.lower() in {".txt", ".md", ".pdf", ".docx"}:
+                if is_credential_document(path):
+                    continue
                 documents.append(str(path.relative_to(base_dir)))
         
         if not documents:
@@ -60,6 +67,8 @@ def search_documents(query: str) -> str:
         
         for path in base_dir.rglob("*"):
             if path.is_file() and path.suffix.lower() in {".txt", ".md", ".pdf", ".docx"}:
+                if is_credential_document(path):
+                    continue
                 if query_lower in path.name.lower():
                     matches.append(str(path.relative_to(base_dir)))
         
