@@ -13,6 +13,9 @@ from rag.query import (
     ask_llm,
     prepare_contexts,
     existence_listing_answer,
+    inventory_overview_answer,
+    format_corpus_overview,
+    REFUSE_ANSWER,
 )
 from mcp.client import MCPClient
 from config import OLLAMA_MODEL
@@ -119,12 +122,13 @@ Available MCP tools:
 3. search_documents(query: str) - Search for documents by name (use when user asks to find a specific document)
 
 Decision rules:
+- If the user asks what documents/topics/info the knowledge base covers, or how to use the assistant, use list_documents
 - If the retrieved chunks fully answer the question, set use_mcp to false
 - If chunks are empty or insufficient, consider using MCP tools
 - If user explicitly asks to read/list/search documents, use the appropriate tool
 - If you need the full content of a specific document mentioned in chunks, use read_document
 - For read_document, file_path MUST be copied EXACTLY from "Available source paths" above. Never invent or shorten paths (e.g. do not invent docs/asyncpg.md).
-- When in doubt, prefer not using MCP (chunks are usually sufficient)
+- When in doubt on topical questions, prefer not using MCP (chunks are usually sufficient)
 
 Respond ONLY with valid JSON, no other text:
 {{"use_mcp": true/false, "tool": "tool_name_or_null", "args": {{"arg_name": "value"}}}}
@@ -196,6 +200,18 @@ Your JSON response:"""
     
     def query(self, user_query: str, verbose=False):
         """Answer a question using RAG and optionally MCP tools."""
+        inventory = inventory_overview_answer(user_query)
+        if inventory is not None:
+            answer, contexts = inventory
+            if verbose:
+                print("📚 Answering from knowledge-base document inventory")
+            return {
+                "answer": answer,
+                "sources": [c["source"] for c in contexts] if contexts else [],
+                "mcp_used": False,
+                "mcp_tool": None,
+            }
+
         contexts = prepare_contexts(user_query, retrieve(user_query))
 
         if verbose:
@@ -231,8 +247,32 @@ Your JSON response:"""
                 if verbose and mcp_result:
                     print(f"✅ MCP tool returned result (length: {len(mcp_result)} chars)")
 
-        prompt = build_prompt(user_query, contexts)
-        if mcp_result:
+        # list_documents + empty RAG must not hit the refuse-only prompt.
+        if (
+            mcp_tool_used == "list_documents"
+            and mcp_result
+            and not str(mcp_result).startswith("Error")
+        ):
+            answer, inv_contexts = format_corpus_overview(howto=True)
+            return {
+                "answer": answer,
+                "sources": [c["source"] for c in inv_contexts],
+                "mcp_used": True,
+                "mcp_tool": mcp_tool_used,
+            }
+
+        gen_contexts = list(contexts) if contexts else []
+        if mcp_result and not gen_contexts and not str(mcp_result).startswith("Error"):
+            gen_contexts = [
+                {
+                    "source": f"mcp:{mcp_tool_used}",
+                    "chunk_id": 0,
+                    "text": mcp_result,
+                }
+            ]
+
+        prompt = build_prompt(user_query, gen_contexts)
+        if mcp_result and contexts:
             injection = (
                 f"\n\n<additional_info_from_mcp_tool>\n{mcp_result}\n"
                 f"</additional_info_from_mcp_tool>\n"
@@ -244,7 +284,9 @@ Your JSON response:"""
                 prompt += injection
 
         answer = ask_llm(prompt)
-        sources = [c["source"] for c in contexts] if contexts else []
+        sources = [c["source"] for c in contexts] if contexts else [
+            c["source"] for c in gen_contexts
+        ]
 
         return {
             "answer": answer,
@@ -279,7 +321,7 @@ if __name__ == "__main__":
             console = Console(force_terminal=True)
             console.print(Markdown(result["answer"]))
             
-            if result["sources"]:
+            if result["sources"] and result["answer"].strip() != REFUSE_ANSWER:
                 print("\n📚 Sources:")
                 seen_sources = set()
                 for src in result["sources"]:

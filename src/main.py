@@ -5,6 +5,7 @@ Company Knowledge Base Assistant - Main Entry Point
 
 import sys
 from assistant import CompanyKBAssistant
+from rag.query import REFUSE_ANSWER
 
 def main():
     """Main entry point for the assistant."""
@@ -41,7 +42,7 @@ def main():
                 result = assistant.query(query, verbose=True)
                 print(result["answer"])
                 
-                if result["sources"]:
+                if result["sources"] and result["answer"].strip() != REFUSE_ANSWER:
                     print("\n📚 Sources:")
                     for src in result["sources"]:
                         print(f"  • {src}")

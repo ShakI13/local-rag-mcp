@@ -45,6 +45,40 @@ _EXISTENCE_ASK_RE = re.compile(
     r"is\s+there|есть\s+ли|does\s+(?:there\s+)?exist|описан",
     re.IGNORECASE,
 )
+# Catalog / coverage questions — not topical "about <subject>" asks.
+_INVENTORY_ASK_RE = re.compile(
+    r"(?:"
+    r"about\s+what\s+you\s+have\b|"
+    r"what\s+(?:docs?|documents)\b|"
+    r"list\s+(?:all\s+)?(?:docs?|documents)\b|"
+    r"what\s+(?:is|are)\s+in\s+the\s+knowledge\s+base\b|"
+    r"what\s+(?:topics?|areas?)\b|"
+    r"what\s+(?:info|information)\s+do\s+you\s+have\s*\??\s*$|"
+    r"what\s+do\s+you\s+(?:have|know)\s*\??\s*$|"
+    r"какие\s+документы\b|"
+    r"о\s+ч[её]м\s+(?:у\s+тебя\s+)?есть\b|"
+    r"что\s+есть\s+в\s+(?:базе|knowledge)\b"
+    r")",
+    re.IGNORECASE,
+)
+# How-to-use / capability questions about the assistant itself.
+_HELP_ASK_RE = re.compile(
+    r"(?:"
+    r"how\s+(?:to\s+|do\s+i\s+)?use\s+you\b|"
+    r"how\s+do\s+you\s+work\b|"
+    r"what\s+can\s+i\s+(?:do|ask)\b|"
+    r"what\s+are\s+you\b|"
+    r"^\s*help\s*\??\s*$|"
+    r"как\s+(?:тобой|вами|этим)\s+пользоваться\b|"
+    r"что\s+(?:ты|вы)\s+умеешь\b|"
+    r"чем\s+(?:ты\s+|вы\s+)?можешь\s+помочь\b"
+    r")",
+    re.IGNORECASE,
+)
+_TOPICAL_ABOUT_RE = re.compile(
+    r"\b(?:about|regarding|про)\s+(?!what\b)(\w{3,})",
+    re.IGNORECASE,
+)
 
 # Lazy globals — avoid loading heavy models on import (tests inject lane doubles)
 _model = None
@@ -205,6 +239,117 @@ def existence_listing_answer(query: str, contexts):
     return (
         f"Yes — dedicated file(s) for {present_txt} exist under /{subdir}: {file_list}."
     )
+
+
+def is_inventory_ask(query: str) -> bool:
+    """True for catalog/coverage questions about the KB as a whole."""
+    q = (query or "").strip()
+    if not q:
+        return False
+    if _EXISTENCE_ASK_RE.search(q):
+        return False
+    if _TOPICAL_ABOUT_RE.search(q) and not re.search(
+        r"about\s+what\s+you\s+have\b", q, re.IGNORECASE
+    ):
+        return False
+    return bool(_INVENTORY_ASK_RE.search(q))
+
+
+def is_help_ask(query: str) -> bool:
+    """True for how-to-use / capability questions about the assistant."""
+    q = (query or "").strip()
+    if not q:
+        return False
+    if _EXISTENCE_ASK_RE.search(q):
+        return False
+    if _TOPICAL_ABOUT_RE.search(q):
+        return False
+    return bool(_HELP_ASK_RE.search(q))
+
+
+def _corpus_file_relpaths():
+    """Relative paths of indexable files under DOCUMENTS_DIR."""
+    base = Path(DOCUMENTS_DIR)
+    if not base.exists():
+        return []
+    docs = []
+    for path in base.rglob("*"):
+        if path.is_file() and path.suffix.lower() in {".txt", ".md", ".pdf", ".docx"}:
+            try:
+                docs.append(str(path.relative_to(base)))
+            except ValueError:
+                continue
+    return sorted(docs)
+
+
+def format_corpus_overview(*, howto: bool = False):
+    """Build a deterministic corpus overview (+ optional how-to-use blurb)."""
+    rels = _corpus_file_relpaths()
+    root = str(Path(DOCUMENTS_DIR))
+    contexts = [
+        {
+            "source": root,
+            "chunk_id": 0,
+            "is_corpus_inventory": True,
+            "text": "\n".join(f"- {r}" for r in rels) if rels else "(empty)",
+        }
+    ]
+    lines = []
+    if howto:
+        lines.extend(
+            [
+                "I am a company knowledge-base assistant. Ask me questions about "
+                "company policies, procedures, and technical documentation, and I "
+                "answer from the indexed documents (not from general knowledge).",
+                "",
+                "You can:",
+                "- Ask factual questions about topics covered in the docs",
+                "- Ask whether a dedicated file/description exists under a folder path",
+                "- Ask what documents or areas are available",
+                "",
+            ]
+        )
+    if not rels:
+        lines.append("The knowledge base currently has no indexed documents.")
+        return "\n".join(lines), contexts
+
+    by_area: dict[str, list[str]] = {}
+    root_files = []
+    for rel in rels:
+        parts = Path(rel).parts
+        if len(parts) == 1:
+            root_files.append(parts[0])
+        else:
+            by_area.setdefault(parts[0], []).append(rel)
+
+    lines.append(
+        "Here is what the knowledge base covers:"
+        if howto
+        else "I have company documentation in the knowledge base. Here is what it covers:"
+    )
+    for area in sorted(by_area):
+        files = by_area[area]
+        lines.append(f"- {area}/ ({len(files)} files)")
+    if root_files:
+        sample = ", ".join(root_files[:8])
+        more = f" (+{len(root_files) - 8} more)" if len(root_files) > 8 else ""
+        lines.append(f"- Top-level files: {sample}{more}")
+    lines.append(
+        "Ask about a specific topic, or name a folder path (e.g. /SomeFolder), for details."
+    )
+    return "\n".join(lines), contexts
+
+
+def inventory_overview_answer(query: str):
+    """
+    Deterministic overview for catalog or how-to-use questions.
+
+    Returns (answer, synthetic_contexts) or None when the query is not meta.
+    """
+    help_ask = is_help_ask(query)
+    if not help_ask and not is_inventory_ask(query):
+        return None
+    return format_corpus_overview(howto=help_ask)
 
 
 def bm25_query_from_expand(keywords: str, query: str) -> str:
@@ -424,6 +569,9 @@ def ask_llm(prompt):
 
 def ask(query: str):
     """Answer a question using RAG."""
+    inventory = inventory_overview_answer(query)
+    if inventory is not None:
+        return inventory
     contexts = prepare_contexts(query, retrieve(query))
     listing_answer = existence_listing_answer(query, contexts)
     if listing_answer is not None:

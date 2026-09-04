@@ -9,6 +9,7 @@ from rag.query import (
     build_prompt,
     existence_listing_answer,
     filter_contexts_for_query,
+    inventory_overview_answer,
     prepare_contexts,
 )
 
@@ -185,6 +186,55 @@ class TestExistenceListingAnswer(unittest.TestCase):
         self.assertIsNone(
             existence_listing_answer("What does Alpha do under /Squad?", contexts)
         )
+
+
+class TestInventoryOverviewAnswer(unittest.TestCase):
+    def test_general_coverage_question_lists_areas_not_refuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Backend").mkdir()
+            (root / "Backend" / "asyncpg.md").write_text("db", encoding="utf-8")
+            (root / "Frontend").mkdir()
+            (root / "Frontend" / "ui.md").write_text("ui", encoding="utf-8")
+            (root / "readme.md").write_text("root", encoding="utf-8")
+
+            with patch("rag.query.DOCUMENTS_DIR", str(root)):
+                answer, sources = inventory_overview_answer(
+                    "About what you have info?"
+                )
+
+            self.assertIsNotNone(answer)
+            lower = answer.lower()
+            self.assertNotEqual(answer.strip(), REFUSE_ANSWER)
+            self.assertIn("backend", lower)
+            self.assertIn("frontend", lower)
+            self.assertIn("readme.md", lower)
+            self.assertTrue(sources)
+            self.assertEqual(sources[0]["source"], str(root))
+
+    def test_does_not_hijack_topical_questions(self):
+        self.assertIsNone(
+            inventory_overview_answer("What information do we have about asyncpg?")
+        )
+        self.assertIsNone(
+            inventory_overview_answer("What do you know about migrations?")
+        )
+
+    def test_help_questions_explain_usage_and_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Backend").mkdir()
+            (root / "Backend" / "asyncpg.md").write_text("db", encoding="utf-8")
+
+            with patch("rag.query.DOCUMENTS_DIR", str(root)):
+                for q in ("How to use you?", "What can I do with you?"):
+                    result = inventory_overview_answer(q)
+                    self.assertIsNotNone(result, q)
+                    answer, _sources = result
+                    lower = answer.lower()
+                    self.assertNotEqual(answer.strip(), REFUSE_ANSWER, q)
+                    self.assertIn("knowledge-base", lower, q)
+                    self.assertIn("backend", lower, q)
 
 
 if __name__ == "__main__":

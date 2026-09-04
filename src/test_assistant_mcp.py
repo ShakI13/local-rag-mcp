@@ -1,6 +1,8 @@
 """Assistant MCP result unwrapping — bad tool payloads must not poison RAG answers."""
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from assistant import CompanyKBAssistant, mcp_tool_text
@@ -74,6 +76,8 @@ class TestAssistantDropsFailedMcpWhenContextsExist(unittest.TestCase):
 
         with patch("assistant.retrieve", return_value=contexts), patch(
             "assistant.prepare_contexts", return_value=contexts
+        ), patch(
+            "assistant.inventory_overview_answer", return_value=None
         ), patch(
             "assistant.existence_listing_answer", return_value=None
         ), patch.object(
@@ -168,5 +172,47 @@ class TestMcpDecisionPromptHintsSources(unittest.TestCase):
         self.assertEqual(args.get("file_path"), real)
 
 
+class TestListDocumentsDoesNotRefuse(unittest.TestCase):
+    def test_list_documents_with_empty_rag_returns_overview(self):
+        asst = CompanyKBAssistant.__new__(CompanyKBAssistant)
+        asst.mcp = MagicMock()
+        asst.llm_client = MagicMock()
+        asst.mcp.call_tool.return_value = {
+            "result": {
+                "content": [{"type": "text", "text": "- Backend/asyncpg.md"}],
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Backend").mkdir()
+            (root / "Backend" / "asyncpg.md").write_text("db", encoding="utf-8")
+
+            with patch("assistant.retrieve", return_value=[]), patch(
+                "assistant.prepare_contexts", return_value=[]
+            ), patch(
+                "assistant.inventory_overview_answer", return_value=None
+            ), patch(
+                "assistant.existence_listing_answer", return_value=None
+            ), patch.object(
+                asst,
+                "_llm_decide_mcp_usage",
+                return_value=("list_documents", {}),
+            ), patch(
+                "rag.query.DOCUMENTS_DIR", str(root)
+            ), patch(
+                "assistant.ask_llm"
+            ) as ask_mock:
+                result = asst.query("random meta that skipped detector", verbose=False)
+
+        ask_mock.assert_not_called()
+        self.assertNotEqual(result["answer"].strip(), REFUSE_ANSWER)
+        self.assertIn("knowledge-base", result["answer"].lower())
+        self.assertIn("backend", result["answer"].lower())
+        self.assertTrue(result["mcp_used"])
+        self.assertEqual(result["mcp_tool"], "list_documents")
+
+
 if __name__ == "__main__":
     unittest.main()
+
