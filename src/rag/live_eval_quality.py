@@ -104,16 +104,16 @@ def check_compound_recall():
 def check_role_nuance():
     raw = retrieve(ROLE_Q)
     contexts = prepare_contexts(ROLE_Q, raw)
-    listing = contexts[0]["text"] if contexts else ""
-    assert "Tech Lead" in listing or any("Роли" in s for s in _sources(contexts))
-    assert "Team Lead.md" not in listing
+    assert any(c.get("is_directory_listing") for c in contexts), _sources(contexts)
+    listing = next(c for c in contexts if c.get("is_directory_listing"))
+    assert "Team Lead.md" not in listing["text"]
     answer, contexts = ask(ROLE_Q)
     lower = answer.lower()
     bare_yes = bool(re.match(r"^\s*yes\b", lower)) and "not" not in lower and "no" not in lower
     print(f"   role sources={_sources(contexts)[:5]}")
     print(f"   answer_snip={answer[:280].replace(chr(10), ' ')!r}")
-    assert not bare_yes, "bare Yes is incorrect for missing Team Lead role file"
-    print("OK 03: role answer is not a bare Yes; /Роли listing is in context")
+    assert not bare_yes, "bare Yes is incorrect when no dedicated file matches"
+    print("OK 03: existence ask injects path listing from query; answer not bare Yes")
 
 
 def main():

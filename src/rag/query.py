@@ -37,10 +37,13 @@ _QUERY_STOPWORDS = frozenset(
     }
 )
 
-_ROLE_INVENTORY_RE = re.compile(
-    r"(?:is\s+there|есть\s+ли).*(?:role\s+description|описан\w*).*(?:/роли|роли)"
-    r"|(?:role\s+description|описан\w*).*(?:under\s+)?(?:/роли|роли)",
-    re.IGNORECASE | re.DOTALL,
+_DIR_REF_RE = re.compile(
+    r"(?:under|in|в)\s+/([^\s/?#,]+)|/([^\s/?#,]+)",
+    re.IGNORECASE,
+)
+_EXISTENCE_ASK_RE = re.compile(
+    r"is\s+there|есть\s+ли|does\s+(?:there\s+)?exist|описан",
+    re.IGNORECASE,
 )
 
 # Lazy globals — avoid loading heavy models on import (tests inject lane doubles)
@@ -54,8 +57,8 @@ def filter_contexts_for_query(query: str, contexts):
     """
     Keep chunks that share a meaningful normalized token with the query.
 
-    Unrelated Top-K hits (e.g. Docker docs for a Kubernetes question) are dropped
-    so generation must refuse instead of inventing from off-topic sources.
+    Unrelated Top-K hits are dropped so generation must refuse instead of
+    inventing from off-topic sources.
     """
     if not contexts:
         return []
@@ -77,40 +80,68 @@ def filter_contexts_for_query(query: str, contexts):
     return kept
 
 
-def roles_directory_chunk():
-    """Synthetic chunk: dedicated role description files that exist under /Роли."""
+def _subdir_named_in_query(query: str) -> str | None:
+    """Return a docs subdirectory name if the query references /Name."""
+    if not query:
+        return None
+    matches = []
+    for m in _DIR_REF_RE.finditer(query):
+        name = m.group(1) or m.group(2)
+        if name:
+            matches.append(name.strip().strip("/\\"))
+    return matches[-1] if matches else None
+
+
+def directory_listing_chunk(subdir: str):
+    """
+    Synthetic chunk: file listing for a docs subdirectory named in the question.
+
+    Path comes from the user query (e.g. /Foo), never from a hardcoded trap folder.
+    """
+    if not subdir or subdir in {".", ".."} or "/" in subdir or "\\" in subdir:
+        return None
     src_dir = Path(__file__).parent.parent
-    roles_dir = src_dir / DOCUMENTS_DIR / "Роли"
-    if not roles_dir.is_dir():
+    docs_root = (src_dir / DOCUMENTS_DIR).resolve()
+    target = (docs_root / subdir).resolve()
+    try:
+        target.relative_to(docs_root)
+    except ValueError:
+        return None
+    if not target.is_dir():
         return None
     names = sorted(
         p.name
-        for p in roles_dir.iterdir()
+        for p in target.iterdir()
         if p.is_file() and p.suffix.lower() in {".md", ".txt", ".docx", ".pdf"}
     )
     if not names:
         return None
     listing = "\n".join(f"- {name}" for name in names)
     text = (
-        "Dedicated role description files that exist under /Роли:\n"
+        f"Files that exist under /{subdir}:\n"
         f"{listing}\n"
-        "A role name merely listed in README (or process docs) is not a dedicated "
-        "role description unless a matching file appears in this list."
+        "A name merely listed or mentioned elsewhere (e.g. README) is not a dedicated "
+        f"description under /{subdir} unless a matching file appears in this list."
     )
     return {
-        "source": str(Path(DOCUMENTS_DIR) / "Роли"),
-        "chunk_id": -1,
+        "source": str(Path(DOCUMENTS_DIR) / subdir),
+        "chunk_id": 0,
+        "is_directory_listing": True,
         "text": text,
     }
 
 
 def prepare_contexts(query: str, contexts):
-    """Filter off-topic chunks and, for role-inventory questions, add /Роли listing."""
+    """Filter off-topic chunks; for existence asks naming /Dir, add that dir's listing."""
     prepared = filter_contexts_for_query(query, contexts)
-    if _ROLE_INVENTORY_RE.search(query or ""):
-        extra = roles_directory_chunk()
-        if extra:
-            prepared = [extra] + [c for c in prepared if c.get("chunk_id") != -1]
+    if _EXISTENCE_ASK_RE.search(query or ""):
+        subdir = _subdir_named_in_query(query)
+        if subdir:
+            extra = directory_listing_chunk(subdir)
+            if extra:
+                prepared = [extra] + [
+                    c for c in prepared if not c.get("is_directory_listing")
+                ]
     return prepared
 
 
@@ -274,7 +305,7 @@ Answer ONLY from the context below.
 - If the context contains facts that answer the question, use those facts. Do not refuse.
 - If the context does not discuss the asked topic, reply with exactly: {REFUSE_ANSWER}
 - Do not invent guidance from unrelated documents.
-- For questions like whether a role description exists under /Роли: a name merely listed or mentioned (e.g. in README) is NOT a dedicated role description. Only treat a dedicated file/content under Роли as a description; if none exists, say so clearly (partial yes / no dedicated doc).
+- For questions about whether a dedicated description/file exists under a folder named in the query: a name merely listed or mentioned elsewhere (e.g. README) is NOT enough. Prefer the directory listing / files under that folder; if none match, say so clearly (partial yes / no dedicated doc).
 Never reveal passwords, API keys, or other secrets if they appear in context.
 </instructions>
 
@@ -312,56 +343,9 @@ def ask_llm(prompt):
     return data["response"]
 
 
-def role_inventory_answer(query: str, contexts):
-    """
-    Deterministic nuance for '/Роли description exists?' questions.
-
-    Small local models often ignore the listing and refuse or say bare Yes;
-    the directory listing chunk is enough to answer without the LLM.
-    """
-    if not _ROLE_INVENTORY_RE.search(query or ""):
-        return None
-    listing = next((c for c in contexts if c.get("chunk_id") == -1), None)
-    if not listing:
-        return None
-    files = [
-        line[2:].strip()
-        for line in listing["text"].splitlines()
-        if line.startswith("- ")
-    ]
-    q = query.lower()
-    asked = []
-    if "team lead" in q:
-        asked.append("Team Lead")
-    if "scrum" in q:
-        asked.append("Scrum Master")
-    if not asked:
-        asked = ["the requested role"]
-
-    missing = []
-    for name in asked:
-        if not any(name.lower() in f.lower() for f in files):
-            missing.append(name)
-
-    file_list = ", ".join(files) if files else "(none)"
-    if missing:
-        missing_txt = " / ".join(missing)
-        return (
-            f"README or process docs may mention {missing_txt}, but there is no dedicated "
-            f"role description file for {missing_txt} under /Роли. "
-            f"Dedicated role files that exist under /Роли are: {file_list}."
-        )
-    return (
-        f"Yes — dedicated role description file(s) exist under /Роли: {file_list}."
-    )
-
-
 def ask(query: str):
     """Answer a question using RAG."""
     contexts = prepare_contexts(query, retrieve(query))
-    role_answer = role_inventory_answer(query, contexts)
-    if role_answer is not None:
-        return role_answer, contexts
     prompt = build_prompt(query, contexts)
     return ask_llm(prompt), contexts
 

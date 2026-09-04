@@ -11,11 +11,11 @@ from rag.secrets_policy import (
 
 
 class TestSecretsPolicy(unittest.TestCase):
-    def test_dostupy_and_english_credential_names_are_flagged(self):
-        self.assertTrue(is_credential_document("docs/Документация/Доступы.md"))
+    def test_credential_filename_stems_are_flagged(self):
+        self.assertTrue(is_credential_document("docs/internal/Доступы.md"))
         self.assertTrue(is_credential_document("docs/credentials.md"))
         self.assertTrue(is_credential_document("passwords.txt"))
-        self.assertFalse(is_credential_document("docs/Роли/Tech Lead.md"))
+        self.assertFalse(is_credential_document("docs/handbook/onboarding.md"))
         self.assertFalse(is_credential_document("migration_policy.md"))
 
     def test_ingest_skips_credential_documents(self):
@@ -24,20 +24,20 @@ class TestSecretsPolicy(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "ok.md").write_text("safe content", encoding="utf-8")
-            (root / "Доступы.md").write_text("email: a\npassword: b\n", encoding="utf-8")
+            (root / "credentials.md").write_text("email: a\npassword: b\n", encoding="utf-8")
 
             with patch("rag.ingest.DOCUMENTS_DIR", str(root)):
                 docs = ingest_documents()
 
             paths = {Path(d["path"]).name for d in docs}
             self.assertIn("ok.md", paths)
-            self.assertNotIn("Доступы.md", paths)
+            self.assertNotIn("credentials.md", paths)
 
     def test_credential_paths_get_mcp_denial_without_file_body(self):
-        denial = credential_read_denial("docs/Документация/Доступы.md")
+        denial = credential_read_denial("docs/internal/Доступы.md")
         self.assertIsNotNone(denial)
         self.assertIn("Access denied", denial)
-        self.assertIsNone(credential_read_denial("docs/Роли/Tech Lead.md"))
+        self.assertIsNone(credential_read_denial("docs/handbook/onboarding.md"))
 
 
 if __name__ == "__main__":

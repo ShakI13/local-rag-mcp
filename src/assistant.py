@@ -12,7 +12,6 @@ from rag.query import (
     build_prompt,
     ask_llm,
     prepare_contexts,
-    role_inventory_answer,
 )
 from mcp.client import MCPClient
 from config import OLLAMA_MODEL
@@ -129,15 +128,6 @@ Your JSON response:"""
 
         if verbose:
             print(f"📚 Retrieved {len(contexts)} relevant chunks from knowledge base")
-
-        role_answer = role_inventory_answer(user_query, contexts)
-        if role_answer is not None:
-            return {
-                "answer": role_answer,
-                "sources": [c["source"] for c in contexts] if contexts else [],
-                "mcp_used": False,
-                "mcp_tool": None,
-            }
 
         mcp_result = None
         mcp_tool_used = None
