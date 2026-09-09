@@ -220,7 +220,6 @@ site/
 .AppleDouble
 .LSOverride
 Icon
-docs/*.md
 docs/*.txt
 docs/*.pdf
 docs/*.docx
