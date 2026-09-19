@@ -17,8 +17,11 @@ from rag.query import (
     format_corpus_overview,
     REFUSE_ANSWER,
 )
+from rag.pipeline_log import line, section
 from mcp.client import MCPClient
 from config import OLLAMA_MODEL
+
+_MCP_DECIDE_TIMEOUT_NOTE = 120
 
 
 def mcp_tool_text(payload) -> str:
@@ -141,7 +144,7 @@ Examples:
 
 Your JSON response:"""
 
-    def _llm_decide_mcp_usage(self, query: str, contexts):
+    def _llm_decide_mcp_usage(self, query: str, contexts, *, verbose: bool = False):
         """Ask LLM if MCP tools are needed based on query and retrieved contexts."""
         if not self.mcp:
             return None, None
@@ -150,6 +153,14 @@ Your JSON response:"""
         allowed_paths = {
             ctx.get("source") for ctx in (contexts or []) if ctx.get("source")
         }
+
+        if verbose:
+            section("6a. MCP decide")
+            line(
+                f"MCP decide start model={OLLAMA_MODEL} "
+                f"prompt_chars={len(decision_prompt)} "
+                f"(chat client; typical timeout ~{_MCP_DECIDE_TIMEOUT_NOTE}s)"
+            )
 
         try:
             response = self.llm_client.chat(
@@ -178,13 +189,24 @@ Your JSON response:"""
                     path = tool_args.get("file_path")
                     if path not in allowed_paths:
                         # Invented / shortened paths are rejected; answer from chunks.
+                        if verbose:
+                            line(
+                                "MCP decide done tool=None "
+                                "(read_document path not in retrieved sources)"
+                            )
                         return None, None
+                if verbose:
+                    line(f"MCP decide done tool={tool_name!r}")
                 return tool_name, tool_args
-            
+
+            if verbose:
+                line("MCP decide done tool=None (use_mcp=false)")
             return None, None
             
-        except Exception as e:
+        except Exception as exc:
             # If LLM decision fails, don't use MCP
+            if verbose:
+                line(f"MCP decide skipped: {type(exc).__name__}: {exc}")
             return None, None
     
     def _call_mcp_tool(self, tool_name: str, tool_args: dict):
@@ -197,6 +219,36 @@ Your JSON response:"""
             return mcp_tool_text(result)
         except Exception as e:
             return f"Error calling MCP tool {tool_name}: {str(e)}"
+
+    def _log_mcp_call(self, tool_name: str, tool_args: dict, mcp_result) -> None:
+        """Verbose: tool, params, and returned text (truncated if huge)."""
+        section("6b. MCP tool call")
+        line(f"tool = {tool_name}")
+        if tool_name == "search_documents":
+            line(
+                "meaning = filename substring search under docs/ "
+                "(not FAISS/BM25 chunk search)"
+            )
+        elif tool_name == "read_document":
+            line("meaning = read full file text from disk")
+        elif tool_name == "list_documents":
+            line("meaning = list all indexable file paths under docs/")
+        line(f"args = {tool_args!r}")
+        if mcp_result is None:
+            line("return = (None)")
+            return
+        text = str(mcp_result)
+        line(f"return length = {len(text)} chars")
+        max_chars = 1200 if tool_name == "read_document" else 4000
+        if len(text) <= max_chars:
+            line("return body:")
+            for row in text.splitlines() or [text]:
+                line(f"  | {row}")
+        else:
+            line(f"return body (first {max_chars} chars):")
+            for row in text[:max_chars].splitlines():
+                line(f"  | {row}")
+            line(f"  | … (+{len(text) - max_chars} more chars)")
     
     def query(self, user_query: str, verbose=False):
         """Answer a question using RAG and optionally MCP tools."""
@@ -204,7 +256,11 @@ Your JSON response:"""
         if inventory is not None:
             answer, contexts = inventory
             if verbose:
-                print("📚 Answering from knowledge-base document inventory")
+                section("ANSWER PATH")
+                line(
+                    "Answering from knowledge-base document inventory "
+                    "(no hybrid retrieve)"
+                )
             return {
                 "answer": answer,
                 "sources": [c["source"] for c in contexts] if contexts else [],
@@ -212,10 +268,13 @@ Your JSON response:"""
                 "mcp_tool": None,
             }
 
-        contexts = prepare_contexts(user_query, retrieve(user_query))
+        contexts = prepare_contexts(
+            user_query, retrieve(user_query, verbose=verbose), verbose=verbose
+        )
 
         if verbose:
-            print(f"📚 Retrieved {len(contexts)} relevant chunks from knowledge base")
+            section("6. Answer generation")
+            line(f"Retrieved {len(contexts)} relevant chunks from knowledge base")
 
         listing_answer = existence_listing_answer(user_query, contexts)
         if listing_answer is not None:
@@ -228,24 +287,26 @@ Your JSON response:"""
 
         mcp_result = None
         mcp_tool_used = None
-        tool_name, tool_args = self._llm_decide_mcp_usage(user_query, contexts)
+        tool_name, tool_args = self._llm_decide_mcp_usage(
+            user_query, contexts, verbose=verbose
+        )
 
         if tool_name:
+            mcp_result = self._call_mcp_tool(tool_name, tool_args or {})
             if verbose:
-                print(f"🔧 LLM decided to use MCP tool: {tool_name} with args: {tool_args}")
-            mcp_result = self._call_mcp_tool(tool_name, tool_args)
+                self._log_mcp_call(tool_name, tool_args or {}, mcp_result)
             # Failed / invented paths must not poison generation when RAG already has facts.
             if mcp_result and mcp_result.startswith("Error") and contexts:
                 if verbose:
-                    print(
-                        f"⚠️  MCP tool failed ({mcp_result[:80]}); "
-                        "answering from retrieved chunks instead"
+                    line(
+                        "MCP error discarded; answering from retrieved chunks instead"
                     )
                 mcp_result = None
             else:
                 mcp_tool_used = tool_name
-                if verbose and mcp_result:
-                    print(f"✅ MCP tool returned result (length: {len(mcp_result)} chars)")
+        elif verbose:
+            section("6b. MCP tool call")
+            line("skipped — model chose no tool (or MCP unavailable)")
 
         # list_documents + empty RAG must not hit the refuse-only prompt.
         if (
@@ -283,7 +344,14 @@ Your JSON response:"""
             else:
                 prompt += injection
 
-        answer = ask_llm(prompt)
+        if verbose:
+            section("6c. Answer from contexts")
+            line(
+                f"gen_contexts={len(gen_contexts)}  "
+                f"mcp_injected={'yes' if mcp_result and contexts else 'no'}  "
+                f"prompt_chars={len(prompt)}"
+            )
+        answer = ask_llm(prompt, verbose=verbose)
         sources = [c["source"] for c in contexts] if contexts else [
             c["source"] for c in gen_contexts
         ]

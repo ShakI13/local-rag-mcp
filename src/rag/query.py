@@ -20,7 +20,8 @@ from config import (
 from rag.bm25_index import Bm25Index
 from rag.expand import expand_query
 from rag.lexical import tokenize_normalized
-from rag.rrf import rrf_fuse
+from rag.pipeline_log import chunk_label, line, preview, section
+from rag.rrf import chunk_identity, rrf_fuse
 
 REFUSE_ANSWER = "I don't have that information in the knowledge base."
 
@@ -165,17 +166,37 @@ def directory_listing_chunk(subdir: str):
     }
 
 
-def prepare_contexts(query: str, contexts):
+def prepare_contexts(query: str, contexts, *, verbose: bool = False):
     """Filter off-topic chunks; for existence asks naming /Dir, add that dir's listing."""
-    prepared = filter_contexts_for_query(query, contexts)
+    before = list(contexts or [])
+    prepared = filter_contexts_for_query(query, before)
+    if verbose:
+        section("5. Prepare contexts (token filter / directory listing)")
+        line(f"After retrieve: {len(before)} chunk(s)")
+        kept_ids = {
+            chunk_identity(c) for c in prepared if "source" in c and "chunk_id" in c
+        }
+        dropped = [c for c in before if chunk_identity(c) not in kept_ids]
+        if dropped:
+            line(f"Dropped {len(dropped)} off-topic hit(s) (no shared query tokens):")
+            for c in dropped:
+                line(f"  − {chunk_label(c)}")
+        else:
+            line("No chunks dropped by token filter")
     if _EXISTENCE_ASK_RE.search(query or ""):
         subdir = _subdir_named_in_query(query)
         if subdir:
             extra = directory_listing_chunk(subdir)
             if extra:
+                if verbose:
+                    line(f"Injected directory listing for /{subdir}")
                 prepared = [extra] + [
                     c for c in prepared if not c.get("is_directory_listing")
                 ]
+    if verbose:
+        line(f"Final contexts for prompt: {len(prepared)}")
+        for i, c in enumerate(prepared, 1):
+            line(f"  #{i} {chunk_label(c)}  {preview(c.get('text') or '', 90)}")
     return prepared
 
 
@@ -458,9 +479,51 @@ def _default_bm25_search(keywords: str, k: int):
     return _bm25_index.search(keywords, k)
 
 
+def _log_lane_hits(title: str, hits, *, score_key: str | None = None) -> None:
+    section(title)
+    if not hits:
+        line("(no hits)")
+        return
+    for rank, hit in enumerate(hits, 1):
+        score = hit.get(score_key) if score_key else None
+        score_s = f"{score:.4f}" if isinstance(score, (int, float)) else "—"
+        line(
+            f"  rank={rank:<2} score={score_s:>8}  "
+            f"{chunk_label(hit)}  {preview(hit.get('text') or '', 80)}"
+        )
+
+
+def _log_rrf(vector_hits, bm25_hits, fused, *, rrf_k: int, top_k: int) -> None:
+    """Recompute RRF contributions for display (does not change fusion)."""
+    section(f"4. RRF fusion  (score = sum 1/({rrf_k}+rank)  keep {top_k})")
+    scores = {}
+    lane_ranks = {}
+    for lane_idx, ranked in enumerate((vector_hits, bm25_hits)):
+        for rank, chunk in enumerate(ranked, start=1):
+            cid = chunk_identity(chunk)
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (rrf_k + rank)
+            lane_ranks.setdefault(cid, []).append((lane_idx, rank))
+    lane_names = ("vector", "bm25")
+    if not fused:
+        line("(no fused chunks)")
+        return
+    for i, chunk in enumerate(fused, 1):
+        cid = chunk_identity(chunk)
+        parts = []
+        for lane_idx, rank in lane_ranks.get(cid, []):
+            name = lane_names[lane_idx]
+            contrib = 1.0 / (rrf_k + rank)
+            parts.append(f"{name}@rank{rank}->{contrib:.5f}")
+        line(
+            f"  #{i} rrf={scores.get(cid, 0.0):.5f}  {chunk_label(chunk)}  "
+            f"[{', '.join(parts) or '—'}]"
+        )
+
+
 def retrieve(
     query: str,
     *,
+    verbose: bool = False,
     _vector_search=None,
     _bm25_search=None,
     _expand=None,
@@ -472,6 +535,9 @@ def retrieve(
     """Retrieve relevant chunks via Hybrid Search (Vector ∥ BM25 → RRF → Top-K)."""
     ensure_ready = _ensure_ready or _default_ensure_ready
     if not ensure_ready():
+        if verbose:
+            section("RETRIEVE")
+            line("Index not ready — returning no chunks")
         return []
 
     vector_search = _vector_search or _default_vector_search
@@ -480,15 +546,38 @@ def retrieve(
     if index is None or len(chunks) == 0:
         # Injected lane doubles may still run without a loaded corpus
         if _vector_search is None and _bm25_search is None:
+            if verbose:
+                section("RETRIEVE")
+                line("Empty corpus — returning no chunks")
             return []
 
     lane_k = LANE_K if _lane_k is None else _lane_k
     top_k = TOP_K if _top_k is None else _top_k
     rrf_k = RRF_K if _rrf_k is None else _rrf_k
 
+    if verbose:
+        section("RETRIEVE (hybrid)")
+        line(f"Question: {query}")
+        line(f"Config: LANE_K={lane_k}  TOP_K={top_k}  RRF_K={rrf_k}")
+        line(
+            f"expand start query_chars={len(query or '')} "
+            f"(Ollama keywords, timeout=30s)"
+        )
+
     expand = _expand or expand_query
     keywords = expand(query)
     bm25_query = bm25_query_from_expand(keywords, query)
+
+    if verbose:
+        line(
+            f"expand done keywords_chars={len(keywords or '')} "
+            f"preview={preview(keywords or '', 120)!r}"
+        )
+        section("1. Expand (keywords for BM25; vector uses original question)")
+        line(f"expand_query -> {keywords!r}")
+        line(f"lexical BM25 query -> {bm25_query!r}")
+        line(f"vector embed -> {query!r}")
+        line(f"lanes start: vector + bm25 (LANE_K={lane_k})")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         fut_vector = pool.submit(vector_search, query, lane_k)
@@ -496,7 +585,22 @@ def retrieve(
         vector_hits = fut_vector.result()
         bm25_hits = fut_bm25.result()
 
-    return rrf_fuse([vector_hits, bm25_hits], rrf_k=rrf_k, top_k=top_k)
+    if verbose:
+        _log_lane_hits(
+            f"2. Vector (FAISS) — top {len(vector_hits)} of LANE_K={lane_k}",
+            vector_hits,
+            score_key="_vector_score",
+        )
+        _log_lane_hits(
+            f"3. BM25 lane (lexical) — top {len(bm25_hits)} of LANE_K={lane_k}",
+            bm25_hits,
+            score_key="_bm25_score",
+        )
+
+    fused = rrf_fuse([vector_hits, bm25_hits], rrf_k=rrf_k, top_k=top_k)
+    if verbose:
+        _log_rrf(vector_hits, bm25_hits, fused, rrf_k=rrf_k, top_k=top_k)
+    return fused
 
 
 def build_prompt(query, contexts):
@@ -545,39 +649,86 @@ Never reveal passwords, API keys, or other secrets if they appear in context.
 """
 
 
-def ask_llm(prompt):
+_ASK_LLM_TIMEOUT = 120
+
+
+def ask_llm(prompt, *, verbose: bool = False):
     """Query Ollama LLM."""
     import requests
 
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-        },
-        timeout=120,
-    )
-    data = response.json()
-    if response.status_code != 200 or "response" not in data:
-        err = data.get("error") or data
-        raise RuntimeError(
-            f"Ollama generate failed (HTTP {response.status_code}, model={OLLAMA_MODEL}): {err}"
+    prompt_chars = len(prompt or "")
+    if verbose:
+        line(
+            f"ask_llm start model={OLLAMA_MODEL} prompt_chars={prompt_chars} "
+            f"timeout={_ASK_LLM_TIMEOUT}"
         )
-    return data["response"]
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+            },
+            timeout=_ASK_LLM_TIMEOUT,
+        )
+    except requests.Timeout as exc:
+        msg = (
+            f"Ollama generate timed out after {_ASK_LLM_TIMEOUT}s "
+            f"(model={OLLAMA_MODEL}, prompt_chars={prompt_chars})"
+        )
+        if verbose:
+            line(f"ask_llm error: {msg}")
+        raise TimeoutError(msg) from exc
+    except requests.RequestException as exc:
+        msg = (
+            f"Ollama generate request failed "
+            f"(model={OLLAMA_MODEL}, prompt_chars={prompt_chars}): {exc}"
+        )
+        if verbose:
+            line(f"ask_llm error: {msg}")
+        raise RuntimeError(msg) from exc
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        msg = (
+            f"Ollama generate returned non-JSON "
+            f"(HTTP {response.status_code}, model={OLLAMA_MODEL})"
+        )
+        if verbose:
+            line(f"ask_llm error: {msg}")
+        raise RuntimeError(msg) from exc
+
+    if response.status_code != 200 or "response" not in data:
+        err = data.get("error") if isinstance(data, dict) else data
+        msg = (
+            f"Ollama generate failed (HTTP {response.status_code}, "
+            f"model={OLLAMA_MODEL}): {err}"
+        )
+        if verbose:
+            line(f"ask_llm error: {msg}")
+        raise RuntimeError(msg)
+
+    text = data["response"]
+    if verbose:
+        line(f"ask_llm done answer_chars={len(text or '')}")
+    return text
 
 
-def ask(query: str):
+def ask(query: str, *, verbose: bool = False):
     """Answer a question using RAG."""
     inventory = inventory_overview_answer(query)
     if inventory is not None:
         return inventory
-    contexts = prepare_contexts(query, retrieve(query))
+    contexts = prepare_contexts(
+        query, retrieve(query, verbose=verbose), verbose=verbose
+    )
     listing_answer = existence_listing_answer(query, contexts)
     if listing_answer is not None:
         return listing_answer, contexts
     prompt = build_prompt(query, contexts)
-    return ask_llm(prompt), contexts
+    return ask_llm(prompt, verbose=verbose), contexts
 
 
 if __name__ == "__main__":
@@ -586,7 +737,7 @@ if __name__ == "__main__":
         if q.lower() in {"exit", "quit"}:
             break
         print("\n🤖 Answer:\n")
-        answer, sources = ask(q)
+        answer, sources = ask(q, verbose=True)
         print(answer)
         if sources:
             print("\n📚 Sources:")

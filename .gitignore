@@ -245,3 +245,8 @@ python-rag/
 
 /**.md
 /**.txt
+/tmp
+
+# Local 60-question gold banks (not for commit / reports)
+docs/RAG-eval-questions.md
+docs/RAG-eval-questions-ru.md
